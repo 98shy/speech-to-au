@@ -1,0 +1,47 @@
+{
+  "package": "lipsync_au25_26_deploy",
+  "scope": "Speech-to-AU intensity prediction for lip-sync ONLY. Predicts AU25 (Lips Part) and AU26 (Jaw Drop) exclusively -- no other AU, no emotion/expression coverage (brow, eye, cheek AUs are entirely out of scope for this package).",
+  "why_only_au25_au26": "Of 9 AUs available in GRID-SpeechAU-training-v1.1 (AU10/12/14/15/17/20/23/25/26) and 4 predictor architectures x 3 feature sets tried, AU25 and AU26 were the only two with consistently strong, model-agnostic test-set signal (ICC(3,1) in the 0.6-0.7 range across nearly every model/feature combination). Every other AU stayed near ICC(3,1)~0, i.e. statistically indistinguishable from not predicting anything -- shipping those would be actively misleading for a rendering pipeline.",
+  "dataset_source": "GRID-SpeechAU-training-v1.1 (33 speakers, 32752 utterances, fixed speaker-disjoint split: train 26872 / validation 2993 / test 2887)",
+  "target": "OpenFace raw_intensity (0-5 scale) for AU25 and AU26. NOTE: this is an OpenFace pseudo-label, not expert FACS ground truth -- performance reflects how well audio predicts OpenFace's output, not true muscular activation.",
+  "audio_feature_pipeline": {
+    "sample_rate": 16000,
+    "target_fps": 25,
+    "mfcc": {"n_mfcc": 13, "n_fft": 400, "win_length": 400, "hop_length": 640, "center": true, "pad_mode": "constant", "deltas": false},
+    "wavlm": {"model_id": "microsoft/wavlm-base-plus", "revision": "4c66d4806a428f2e922ccfa1a962776e232d487b", "layer": "final_hidden_state", "frozen": true, "native_hop_seconds": 0.02, "alignment": "linear_interpolation_to_25fps"},
+    "combined": "mfcc (13-d) concatenated with wavlm (768-d) -> 781-d, both resampled to 25fps then truncated to T = min(mfcc_len, wavlm_len)",
+    "extractor_module": "audio_feature_extractor.py (one directory up), function extract_combined(wav_path)",
+    "validated_against_shipped_features": "MFCC: mean abs diff 3.2e-6 (float32 rounding only). WavLM: per-dimension correlation mean 0.955 (98.8% of dims > 0.9) against the dataset's own shipped float16 features -- residual difference attributable to float16 storage quantization, not an extraction bug."
+  },
+  "specialists": {
+    "AU25": {
+      "model": "Mamba (Selective SSM backbone, speech_to_au_mamba.SpeechToAUMamba)",
+      "feature": "combined",
+      "checkpoint": "checkpoints/mamba_combined.pt",
+      "test_metrics": {"mae": 0.3351, "mse": 0.2132, "rmse": 0.4618, "pearson": 0.7020, "icc_3_1": 0.7020, "num_valid_frames": 191198},
+      "picked_because": "Best ICC(3,1) for AU25 among {TCN, TCN+GPT2, Mamba, Diffusion} x {mfcc, wavlm, combined} (12 combos)"
+    },
+    "AU26": {
+      "model": "TCN (causal dilated conv, speech_to_au_tcn.SpeechToAU)",
+      "feature": "combined",
+      "checkpoint": "checkpoints/tcn_combined.pt",
+      "test_metrics": {"mae": 0.2362, "mse": 0.1124, "rmse": 0.3353, "pearson": 0.7010, "icc_3_1": 0.6932, "num_valid_frames": 191198},
+      "picked_because": "Best ICC(3,1) for AU26 among the same 12 combos"
+    }
+  },
+  "known_limitations": [
+    "No coverage of AU10/12/14/15/17/20/23 -- all were tried and found unreliable (ICC(3,1) near 0); do not request them from this package.",
+    "No coverage of upper-face AUs (brow/eye/cheek) -- not present in the source dataset at all.",
+    "Trained and speaker-split-evaluated on GRID corpus audio only (short, clean, single-speaker read-speech clips, ~3s). Performance on noisy, multi-speaker, or emotionally expressive speech is unvalidated.",
+    "AU25/AU26 targets are OpenFace pseudo-labels, not expert-annotated ground truth.",
+    "Output is intensity only (0-5 continuous scale), not binary presence."
+  ],
+  "output_contract": {
+    "function": "infer.predict(wav_path) -> dict",
+    "keys": {
+      "timestamp_sec": "float64[T], T = duration_sec * 25 (approx), one entry per output frame",
+      "AU25": "float32[T], clipped to [0, 5]",
+      "AU26": "float32[T], clipped to [0, 5]"
+    }
+  }
+}
