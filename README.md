@@ -1,73 +1,137 @@
-# Speech → AU25/AU26 (lip-sync only)
+# lipsync_7au_deploy
 
-이 패키지는 **립싱크 관련 AU25(Lips Part)와 AU26(Jaw Drop) 두 개만** 예측합니다.
-다른 AU(눈썹/눈/뺨 등 표정 관련)는 이 패키지의 범위가 아니며, 애초에 신뢰할 수
-있는 성능이 나오지 않아 의도적으로 제외했습니다.
+Self-contained speech -> facial Action Unit (AU) intensity inference package.
+Successor to `lipsync_au25_26_deploy` (AU25/AU26 only) -- this package adds
+AU10, AU12, AU14, AU17, AU23, bringing coverage to 7 of the 9 AUs originally
+tried in this project.
 
-## 왜 AU25/AU26만인가
-
-`experiment/grid_speechau_v1_1`에서 4개 predictor(TCN / TCN+GPT2 / Mamba /
-Diffusion) x 3개 feature(MFCC / WavLM / MFCC+WavLM)로 9개 AU
-(AU10/12/14/15/17/20/23/25/26)를 전부 실험한 결과, **AU25와 AU26만** 모델·피처에
-관계없이 일관되게 ICC(3,1) 0.6~0.7 수준의 유의미한 예측력을 보였습니다. 나머지
-AU는 전부 ICC(3,1)이 0 근방으로, 사실상 "아무거나 예측 안 하는 것"과 통계적으로
-구분이 안 되는 수준입니다. 이런 AU를 렌더링 팀에 넘기면 오히려 잘못된 애니메이션을
-만들게 되므로 명시적으로 제외했습니다.
-
-## 파이프라인
-
-```
-raw wav (16kHz)
-  -> audio_feature_extractor.extract_combined()   # MFCC(13) + WavLM-base-plus(768) = 781차원, 25fps
-  -> AU25: Mamba(+combined) 체크포인트
-  -> AU26: TCN(+combined) 체크포인트
-  -> AU25/AU26 강도 곡선 (0~5 스케일, 25fps)
-```
-
-두 AU는 서로 다른 모델에서 나옵니다 — AU25는 Mamba, AU26은 TCN. 이는 각 AU별로
-9개 AU를 동시에 예측하는 원래 모델(각각 9-AU 출력을 가짐)에서 **해당 AU 채널만
-뽑아 쓰는 것**입니다.
-
-## 사용법
-
-```bash
-python infer.py --wav path/to/speech.wav --out predictions.npz
-```
-
-`predictions.npz`에는 `timestamp_sec`, `AU25`, `AU26` (모두 길이 T, 25fps 정렬)가
-들어 있습니다.
-
-## 성능 (GRID 고정 test split, 2887발화)
-
-| AU | 모델 | MAE | PCC | ICC(3,1) |
-|---|---|---|---|---|
-| AU25 | Mamba+Combined | 0.335 | 0.702 | 0.702 |
-| AU26 | TCN+Combined | 0.236 | 0.701 | 0.693 |
-
-## 한계 및 주의사항 (자세한 건 config.json 참고)
-
-1. **AU10/12/14/15/17/20/23은 지원하지 않습니다.** 시도했지만 신뢰할 수 없었습니다.
-2. **눈썹/눈 관련 AU는 아예 데이터셋에 없습니다.**
-3. GRID 코퍼스(짧고 깨끗한 단일 화자 낭독체, ~3초)로만 검증했습니다 — 잡음이 있거나
-   여러 화자가 겹치는 음성, 감정 표현이 강한 음성에서의 성능은 검증되지 않았습니다.
-4. 타깃 자체가 전문가 FACS 라벨이 아니라 **OpenFace pseudo-label**입니다.
-5. 강도(intensity, 0~5 연속값)만 예측하며, 발생 여부(presence)는 별도로 계산하지
-   않습니다.
-
-## 폴더 구성
-
-```
-config.json               -- 전체 스펙(피처 추출 파라미터, 체크포인트 경로, 성능, 한계) 기계 판독 가능한 형태
-infer.py                  -- wav -> AU25/AU26 추론 스크립트
-audio_feature_extractor.py -- wav -> MFCC+WavLM 781차원 피처 추출
-model/                    -- TCN, Mamba 모델 정의 (predictor 구조 코드)
-checkpoints/              -- mamba_combined.pt (AU25용), tcn_combined.pt (AU26용)
-requirements.txt          -- 필요 파이썬 패키지
-```
-
-이 폴더 하나만 있으면 실행 가능한 self-contained 패키지입니다 (외부 프로젝트 경로에 의존하지 않음).
+## Quick start
 
 ```bash
 pip install -r requirements.txt
 python infer.py --wav path/to/speech.wav --out predictions.npz
 ```
+
+```python
+import infer
+result = infer.predict("path/to/speech.wav")
+# result: {"timestamp_sec": [...], "AU10": [...], "AU12": [...], "AU14": [...],
+#          "AU17": [...], "AU23": [...], "AU25": [...], "AU26": [...]}
+```
+
+Each AU array is float32, clipped to OpenFace's [0, 5] intensity scale, one
+value per 25fps frame.
+
+## What's inside
+
+- `audio_feature_extractor.py` -- raw 16kHz wav -> WavLM Base+ features
+  (768-d, resampled to 25fps). This is the ONLY feature type used by every
+  specialist in this package (see "Why WavLM-only" below). The module also
+  still contains MFCC/combined extraction code inherited from the previous
+  package version, but `infer.py` does not call it.
+- `model/` -- the 3 architectures needed: TCN, Mamba (Selective SSM), and
+  CauseRNN (CAUSE BiLSTM variant, Kameoka et al. Interspeech 2022).
+- `checkpoints/` -- 4 files. Each predicts all 9 of its source dataset's
+  target AUs internally; `infer.py` keeps only the AU(s) assigned to it (see
+  table below) and discards the rest.
+
+## Why WavLM-only (not MFCC+WavLM "combined")
+
+Two reasons, checked empirically before deciding:
+1. On GRID, AU25/AU26 performance barely changes between wavlm-only and
+   combined (PCC gap <=0.013 in every model tried).
+2. On CREMA-D, most AUs performed as well or *better* on wavlm alone than on
+   combined.
+
+Fixing the whole package to one feature extractor also simplifies real-time
+inference: a single WavLM pass feeds all 4 specialists, no MFCC extraction
+needed at all.
+
+## Per-AU specialist routing
+
+Every AU in this package is predicted by whichever (dataset, model)
+combination had the best test-set metrics for that specific AU, compared
+across 5 datasets (GRID-SpeechAU-training-v1.1, IEMOCAP-SpeechAU-v2,
+HDTF-SpeechAU-v2, CREMAD-SpeechAU-v1, RAVDESS-SpeechAU-v1) x up to 7 model
+architectures x up to 3 features (wavlm-only comparisons decided the final
+pick; see `config.json`'s `selection_method` for the full priority order:
+PCC 1st, ICC(3,1) 2nd, MAE/MSE 3rd as a tiebreaker only).
+
+| AU | Source dataset | Model | Checkpoint | PCC | ICC(3,1) |
+|---|---|---|---|---|---|
+| AU10 | GRID | Mamba | `grid_mamba_wavlm.pt` | 0.452 | 0.442 |
+| AU12 | CREMA-D | Mamba | `cremad_mamba_wavlm.pt` | 0.543 | 0.424 |
+| AU14 | CREMA-D | Mamba | `cremad_mamba_wavlm.pt` | 0.471 | 0.366 |
+| AU17 | CREMA-D | CauseRNN | `cremad_cause_rnn_wavlm.pt` | 0.586 | 0.502 |
+| AU23 | CREMA-D | CauseRNN | `cremad_cause_rnn_wavlm.pt` | 0.493 | 0.335 |
+| AU25 | GRID | Mamba | `grid_mamba_wavlm.pt` | 0.696 | 0.696 |
+| AU26 | GRID | TCN | `grid_tcn_wavlm.pt` | 0.681 | 0.664 |
+
+Note `grid_mamba_wavlm.pt` is loaded once and reused for both AU10 and AU25
+(same checkpoint, two output channels kept); `cremad_mamba_wavlm.pt` is
+likewise shared by AU12/AU14, and `cremad_cause_rnn_wavlm.pt` by AU17/AU23.
+`infer.py` caches each checkpoint so it's only loaded/run once regardless of
+how many AUs point at it.
+
+**Each checkpoint stores its own mean/std** (computed from that specialist's
+own training-set WavLM features) alongside its weights. `infer.py` always
+normalizes with the checkpoint's own stats -- never share normalization
+across specialists, since they were fit on different training-data
+distributions.
+
+## Why AU15 and AU20 are excluded
+
+Both stayed at ICC(3,1) ~0-0.15 across every one of the ~30-100+ (dataset,
+model, feature) combinations tried across all 5 datasets -- i.e.
+statistically indistinguishable from not predicting anything. Shipping them
+would be actively misleading for a rendering pipeline. Do not request them
+from this package.
+
+## Known limitations (read before using for anything load-bearing)
+
+- **Domain mismatch risk (biggest open question, now quantified)**:
+  AU10/12/14/17/23 are trained on CREMA-D -- short (~2.5s),
+  professionally-acted, deliberately exaggerated emotional speech.
+  AU10/25/26 are trained on GRID -- short (~3s), clean, single-speaker read
+  speech. Neither matches natural conversational speech (nor whatever the
+  eventual deployment domain's actual input distribution looks like). A
+  cross-domain sanity check ran every checkpoint on the 4 datasets it was
+  NOT trained on (full per-AU/per-dataset numbers in
+  `cross_domain_sanity_check_results.csv`, this directory; the generating
+  script lives in the main project repo, not shipped here since it needs
+  the full multi-dataset training data to run) -- performance drops
+  substantially outside the native domain, confirming this risk is real,
+  not just theoretical:
+
+  | Checkpoint | AU | Native PCC | Best cross-domain PCC | Worst cross-domain PCC |
+  |---|---|---|---|---|
+  | GRID/mamba | AU10 | 0.452 | 0.183 (RAVDESS) | **-0.037 (IEMOCAP)** |
+  | GRID/mamba | AU25 | 0.696 | 0.490 (CREMA-D) | 0.204 (IEMOCAP) |
+  | GRID/tcn | AU26 | 0.681 | 0.516 (CREMA-D) | 0.169 (IEMOCAP) |
+  | CREMA-D/mamba | AU12 | 0.543 | 0.325 (IEMOCAP) | 0.149 (GRID) |
+  | CREMA-D/mamba | AU14 | 0.471 | 0.260 (HDTF) | **-0.012 (GRID)** |
+  | CREMA-D/CauseRNN | AU17 | 0.586 | 0.245 (HDTF) | 0.074 (IEMOCAP) |
+  | CREMA-D/CauseRNN | AU23 | 0.493 | 0.248 (GRID) | 0.040 (RAVDESS) |
+
+  Two patterns worth noting: (1) GRID- and CREMA-D-trained specialists
+  transfer to *each other* better than to IEMOCAP or RAVDESS -- both are
+  solo-speaker, fixed-frontal-camera, scripted-utterance recordings, so they
+  are closer to each other than to IEMOCAP's natural dyadic conversation
+  (the most different domain along nearly every axis: real dialogue,
+  natural head movement, free-form content). (2) IEMOCAP is consistently
+  the worst or near-worst transfer target across every checkpoint -- if the
+  eventual deployment input looks more like natural conversation than
+  scripted/acted delivery, expect performance closer to these cross-domain
+  numbers than to the native ones reported above. Re-run
+  `cross_domain_sanity_check.py` against real target-domain audio as soon as
+  it's available.
+- **Selection-bias caveat**: every specialist above was picked by comparing
+  test metrics across a large number of candidates. The reported PCC/ICC are
+  likely mildly optimistic versus true generalization performance for that
+  reason. Recommend an independent validation pass (fresh data, not reused
+  from the comparison pool) before treating these numbers as final.
+- AU labels across all 5 source datasets are OpenFace 2.2.0 pseudo-labels,
+  not expert-annotated FACS ground truth.
+- Output is intensity only (0-5 continuous scale), not binary presence.
+- No coverage of upper-face AUs (brow/eye/cheek) -- not present in these
+  datasets' primary target sets.
