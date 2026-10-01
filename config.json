@@ -1,45 +1,47 @@
 {
-  "package": "lipsync_7au_deploy",
-  "scope": "Speech-to-AU intensity prediction for lip-sync + expression. Predicts AU10, AU12, AU14, AU17, AU23, AU25, AU26 (7 of 9 AUs tried). AU15 and AU20 are deliberately excluded -- see known_limitations.",
-  "selection_method": "For each AU, every (dataset, model, feature) combination tried across 5 datasets (GRID-SpeechAU-training-v1.1, IEMOCAP-SpeechAU-v2, HDTF-SpeechAU-v2, CREMAD-SpeechAU-v1, RAVDESS-SpeechAU-v1) x up to 7 model architectures (CauseMLP/RNN/CNN/DCNN, TCN, TCN+GPT2, Mamba) x up to 3 features (mfcc, wavlm, combined) was compared on test-set PCC (1st priority), ICC(3,1) (2nd priority), then MAE/MSE (3rd priority, tiebreaker only). Feature extraction was fixed to WavLM Base+ only (not combined) for every specialist in this package: GRID's own AU25/AU26 combined-vs-wavlm gap was small (<=0.013 PCC), and most CREMA-D AUs performed as well or better on wavlm alone -- fixing one feature extractor project-wide also simplifies the real-time inference pipeline (single WavLM pass feeds every specialist).",
+  "package": "lipsync_au25_26_deploy",
+  "scope": "Speech-to-AU intensity prediction for lip-sync ONLY. Predicts AU25 (Lips Part) and AU26 (Jaw Drop) exclusively -- no other AU, no emotion/expression coverage (brow, eye, cheek AUs are entirely out of scope for this package).",
+  "why_only_au25_au26": "Of 9 AUs available in GRID-SpeechAU-training-v1.1 (AU10/12/14/15/17/20/23/25/26) and 4 predictor architectures x 3 feature sets tried, AU25 and AU26 were the only two with consistently strong, model-agnostic test-set signal (ICC(3,1) in the 0.6-0.7 range across nearly every model/feature combination). Every other AU stayed near ICC(3,1)~0, i.e. statistically indistinguishable from not predicting anything -- shipping those would be actively misleading for a rendering pipeline.",
+  "dataset_source": "GRID-SpeechAU-training-v1.1 (33 speakers, 32752 utterances, fixed speaker-disjoint split: train 26872 / validation 2993 / test 2887)",
+  "target": "OpenFace raw_intensity (0-5 scale) for AU25 and AU26. NOTE: this is an OpenFace pseudo-label, not expert FACS ground truth -- performance reflects how well audio predicts OpenFace's output, not true muscular activation.",
   "audio_feature_pipeline": {
     "sample_rate": 16000,
     "target_fps": 25,
+    "mfcc": {"n_mfcc": 13, "n_fft": 400, "win_length": 400, "hop_length": 640, "center": true, "pad_mode": "constant", "deltas": false},
     "wavlm": {"model_id": "microsoft/wavlm-base-plus", "revision": "4c66d4806a428f2e922ccfa1a962776e232d487b", "layer": "final_hidden_state", "frozen": true, "native_hop_seconds": 0.02, "alignment": "linear_interpolation_to_25fps"},
-    "extractor_module": "audio_feature_extractor.py (this directory), function extract_wavlm(wav_path)",
-    "note": "mfcc/combined extraction code is still present in audio_feature_extractor.py (inherited from the earlier lipsync_au25_26_deploy package) but is UNUSED by infer.py -- every specialist in this package is wavlm-only."
+    "combined": "mfcc (13-d) concatenated with wavlm (768-d) -> 781-d, both resampled to 25fps then truncated to T = min(mfcc_len, wavlm_len)",
+    "extractor_module": "audio_feature_extractor.py (one directory up), function extract_combined(wav_path)",
+    "validated_against_shipped_features": "MFCC: mean abs diff 3.2e-6 (float32 rounding only). WavLM: per-dimension correlation mean 0.955 (98.8% of dims > 0.9) against the dataset's own shipped float16 features -- residual difference attributable to float16 storage quantization, not an extraction bug."
   },
   "specialists": {
-    "AU10": {"source_dataset": "GRID-SpeechAU-training-v1.1", "model": "Mamba", "checkpoint": "checkpoints/grid_mamba_wavlm.pt",
-      "test_metrics": {"pearson": 0.4517, "icc_3_1": 0.4418, "mae": 0.2718, "mse": null}},
-    "AU12": {"source_dataset": "CREMAD-SpeechAU-v1", "model": "Mamba", "checkpoint": "checkpoints/cremad_mamba_wavlm.pt",
-      "test_metrics": {"pearson": 0.5430, "icc_3_1": 0.4235, "mae": 0.3998, "mse": 0.4928}},
-    "AU14": {"source_dataset": "CREMAD-SpeechAU-v1", "model": "Mamba", "checkpoint": "checkpoints/cremad_mamba_wavlm.pt",
-      "test_metrics": {"pearson": 0.4708, "icc_3_1": 0.3665, "mae": 0.3467, "mse": 0.3235}},
-    "AU17": {"source_dataset": "CREMAD-SpeechAU-v1", "model": "CauseRNN (CAUSE BiLSTM variant)", "checkpoint": "checkpoints/cremad_cause_rnn_wavlm.pt",
-      "test_metrics": {"pearson": 0.5862, "icc_3_1": 0.5018, "mae": 0.2955, "mse": 0.1852}},
-    "AU23": {"source_dataset": "CREMAD-SpeechAU-v1", "model": "CauseRNN (CAUSE BiLSTM variant)", "checkpoint": "checkpoints/cremad_cause_rnn_wavlm.pt",
-      "test_metrics": {"pearson": 0.4925, "icc_3_1": 0.3350, "mae": 0.1014, "mse": 0.0453}},
-    "AU25": {"source_dataset": "GRID-SpeechAU-training-v1.1", "model": "Mamba", "checkpoint": "checkpoints/grid_mamba_wavlm.pt",
-      "test_metrics": {"pearson": 0.6955, "icc_3_1": 0.6955, "mae": 0.3334, "mse": null}},
-    "AU26": {"source_dataset": "GRID-SpeechAU-training-v1.1", "model": "TCN", "checkpoint": "checkpoints/grid_tcn_wavlm.pt",
-      "test_metrics": {"pearson": 0.6810, "icc_3_1": 0.6639, "mae": 0.2577, "mse": null}}
+    "AU25": {
+      "model": "Mamba (Selective SSM backbone, speech_to_au_mamba.SpeechToAUMamba)",
+      "feature": "combined",
+      "checkpoint": "checkpoints/mamba_combined.pt",
+      "test_metrics": {"mae": 0.3351, "mse": 0.2132, "rmse": 0.4618, "pearson": 0.7020, "icc_3_1": 0.7020, "num_valid_frames": 191198},
+      "picked_because": "Best ICC(3,1) for AU25 among {TCN, TCN+GPT2, Mamba, Diffusion} x {mfcc, wavlm, combined} (12 combos)"
+    },
+    "AU26": {
+      "model": "TCN (causal dilated conv, speech_to_au_tcn.SpeechToAU)",
+      "feature": "combined",
+      "checkpoint": "checkpoints/tcn_combined.pt",
+      "test_metrics": {"mae": 0.2362, "mse": 0.1124, "rmse": 0.3353, "pearson": 0.7010, "icc_3_1": 0.6932, "num_valid_frames": 191198},
+      "picked_because": "Best ICC(3,1) for AU26 among the same 12 combos"
+    }
   },
   "known_limitations": [
-    "AU15 and AU20 are excluded entirely -- both stayed at ICC(3,1) ~0-0.15 across every dataset/model/feature combination tried (5 datasets, up to 7 models, up to 3 features each); do not request them from this package.",
-    "No coverage of upper-face AUs (brow/eye/cheek) -- not present in these source datasets' primary target set.",
-    "AU10/12/14/17/23 specialists are trained on CREMA-D (short, professionally-acted, exaggerated emotional speech, ~2.5s avg clip). Performance on natural conversational speech or the eventual target deployment domain is UNVALIDATED -- this is the single biggest open risk for this package (see README.md).",
-    "AU25/26/AU10(also) specialists are trained on GRID (short, clean, single-speaker read-speech clips, ~3s). Same short-clip caveat applies.",
-    "Every specialist was selected by comparing test-set metrics across ~30-100+ (dataset, model, feature) candidates per AU -- this is a multiple-comparisons/selection-bias situation, so the reported numbers here are likely a mild overestimate of true generalization performance. Recommend a fresh, independent validation pass before treating these numbers as final.",
-    "All AU labels (across all 5 source datasets) are OpenFace 2.2.0 pseudo-labels, not expert-annotated FACS ground truth.",
-    "Output is intensity only (0-5 continuous scale), not binary presence.",
-    "Each specialist checkpoint predicts all 9 of its own training dataset's target AUs internally, but only the AU(s) listed above are extracted and returned -- the rest of each model's output is computed but discarded by design (see infer.py docstring)."
+    "No coverage of AU10/12/14/15/17/20/23 -- all were tried and found unreliable (ICC(3,1) near 0); do not request them from this package.",
+    "No coverage of upper-face AUs (brow/eye/cheek) -- not present in the source dataset at all.",
+    "Trained and speaker-split-evaluated on GRID corpus audio only (short, clean, single-speaker read-speech clips, ~3s). Performance on noisy, multi-speaker, or emotionally expressive speech is unvalidated.",
+    "AU25/AU26 targets are OpenFace pseudo-labels, not expert-annotated ground truth.",
+    "Output is intensity only (0-5 continuous scale), not binary presence."
   ],
   "output_contract": {
     "function": "infer.predict(wav_path) -> dict",
     "keys": {
       "timestamp_sec": "float64[T], T = duration_sec * 25 (approx), one entry per output frame",
-      "AU10, AU12, AU14, AU17, AU23, AU25, AU26": "float32[T] each, clipped to [0, 5]"
+      "AU25": "float32[T], clipped to [0, 5]",
+      "AU26": "float32[T], clipped to [0, 5]"
     }
   }
 }
